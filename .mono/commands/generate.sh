@@ -28,6 +28,8 @@ generate::help() {
   echo "  mono generate app my-app"
   echo "  mono generate app my-app --template bun"
   echo "  mono generate app backend/my-api --template bun"
+  echo "  mono generate lib shared-utils --template bun"
+  echo "  mono generate lib shared/config --template minimal"
   echo ""
 }
 

@@ -1,0 +1,7 @@
+{
+  "name": "{{LIB_NAME}}",
+  "type": "lib",
+  "path": "libs/{{LIB_PATH}}",
+  "targets": {},
+  "dependencies": []
+}

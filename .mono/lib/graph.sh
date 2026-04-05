@@ -29,6 +29,33 @@ graph::get_dependencies() {
   echo "${deps_line}" | sed 's/.*\[//; s/\].*//' | tr ',' '\n' | sed 's/[[:space:]]*"//g; /^$/d'
 }
 
+# ─── Auto-Detection: @libs/ Imports aus Source-Dateien erkennen ─────────────
+# Scannt .ts/.tsx/.js/.jsx Dateien nach import/require mit @libs/ Pfaden.
+# Gibt erkannte Lib-Namen zeilenweise aus (dedupliziert).
+graph::auto_detect_deps() {
+  local project_dir="$1"
+  local full_dir="${MONO_ROOT}/${project_dir}"
+
+  [[ -d "${full_dir}" ]] || return 0
+
+  # Source-Dateien finden (node_modules, dist, .mono, coverage ausschließen)
+  local import_matches
+  import_matches="$(find "${full_dir}" \
+    -type d \( -name node_modules -o -name dist -o -name .mono -o -name coverage -o -name out -o -name .cache \) -prune \
+    -o -type f \( -name '*.ts' -o -name '*.tsx' -o -name '*.js' -o -name '*.jsx' \) -print0 \
+    2>/dev/null \
+    | xargs -0 grep -h -oE '(from|require\()\s*["\x27]@libs/[^"\x27]+["\x27]' 2>/dev/null || true)"
+
+  [[ -z "${import_matches}" ]] && return 0
+
+  # Lib-Namen extrahieren: @libs/shared-utils/foo → shared-utils
+  echo "${import_matches}" \
+    | sed "s/.*@libs\///" \
+    | sed "s/[\"'].*//" \
+    | sed 's/\/.*//' \
+    | sort -u
+}
+
 # ─── Alle Projekte mit project.json finden ──────────────────────────────────
 graph::find_all_projects() {
   for dir in "${MONO_ROOT}/apps" "${MONO_ROOT}/libs"; do
@@ -94,9 +121,11 @@ graph::build() {
     _GRAPH_NODES="${_GRAPH_NODES}${proj}"$'\n'
     _GRAPH_NAMES="${_GRAPH_NAMES}${proj}=${name}"$'\n'
 
-    # Dependencies auflösen
-    local deps
-    deps="$(graph::get_dependencies "${pjson}")"
+    # Dependencies: manuell (project.json) + auto-detected (@libs/ Imports) mergen
+    local manual_deps auto_deps all_deps
+    manual_deps="$(graph::get_dependencies "${pjson}")"
+    auto_deps="$(graph::auto_detect_deps "${proj}")"
+    all_deps="$(printf '%s\n%s' "${manual_deps}" "${auto_deps}" | grep -v '^$' | sort -u || true)"
 
     while IFS= read -r dep; do
       [[ -z "${dep}" ]] && continue
@@ -106,7 +135,7 @@ graph::build() {
         continue
       }
       _GRAPH_EDGES="${_GRAPH_EDGES}${proj}→${dep_path}"$'\n'
-    done <<< "${deps}"
+    done <<< "${all_deps}"
   done <<< "${all_projects}"
 }
 
@@ -294,6 +323,102 @@ graph::topo_sort() {
 
   # Ausgabe
   echo "${sorted}" | grep -v '^$'
+}
+
+# ─── Topologische Sortierung in Batches ────────────────────────────────────
+# Wie topo_sort, aber Batches (gleichzeitig ausführbare Projekte) werden
+# durch "---" getrennt. Projekte innerhalb eines Batches sind unabhängig
+# und können parallel ausgeführt werden.
+graph::topo_batches() {
+  local filter_list="$1"
+
+  local nodes
+  if [[ -n "${filter_list}" ]]; then
+    nodes="${filter_list}"
+  else
+    nodes="${_GRAPH_NODES}"
+  fi
+
+  local all_nodes=""
+  local node_count=0
+  while IFS= read -r node; do
+    [[ -z "${node}" ]] && continue
+    all_nodes="${all_nodes}${node}"$'\n'
+    node_count=$((node_count + 1))
+  done <<< "${nodes}"
+
+  # In-Degree berechnen
+  local in_degrees=""
+  while IFS= read -r node; do
+    [[ -z "${node}" ]] && continue
+    local degree=0
+    while IFS= read -r edge; do
+      [[ -z "${edge}" ]] && continue
+      local from="${edge%%→*}"
+      local to="${edge##*→}"
+      if [[ "${from}" == "${node}" ]] && echo "${all_nodes}" | grep -q "^${to}$"; then
+        degree=$((degree + 1))
+      fi
+    done <<< "${_GRAPH_EDGES}"
+    in_degrees="${in_degrees}${node}=${degree}"$'\n'
+  done <<< "${all_nodes}"
+
+  local count=0
+  local remaining="${all_nodes}"
+  local first_batch=true
+
+  while [[ ${count} -lt ${node_count} ]]; do
+    local found_any=false
+    local next_remaining=""
+    local batch=""
+
+    while IFS= read -r node; do
+      [[ -z "${node}" ]] && continue
+      local degree
+      degree="$(echo "${in_degrees}" | grep "^${node}=" | head -1 | cut -d= -f2)"
+      [[ -z "${degree}" ]] && degree=0
+
+      if [[ ${degree} -eq 0 ]]; then
+        batch="${batch}${node}"$'\n'
+        found_any=true
+      else
+        next_remaining="${next_remaining}${node}"$'\n'
+      fi
+    done <<< "${remaining}"
+
+    if [[ "${found_any}" != true ]]; then
+      mono::error "Zyklische Abhängigkeit erkannt!"
+      return 1
+    fi
+
+    # Batch-Separator ausgeben (nicht vor dem ersten Batch)
+    if [[ "${first_batch}" != true ]]; then
+      echo "---"
+    fi
+    first_batch=false
+
+    echo "${batch}" | grep -v '^$'
+    count=$((count + $(echo "${batch}" | grep -c -v '^$')))
+
+    # In-Degrees aktualisieren
+    while IFS= read -r processed; do
+      [[ -z "${processed}" ]] && continue
+      while IFS= read -r edge; do
+        [[ -z "${edge}" ]] && continue
+        local from="${edge%%→*}"
+        local to="${edge##*→}"
+        if [[ "${to}" == "${processed}" ]]; then
+          local old_degree
+          old_degree="$(echo "${in_degrees}" | grep "^${from}=" | head -1 | cut -d= -f2)"
+          [[ -z "${old_degree}" ]] && continue
+          local new_degree=$((old_degree - 1))
+          in_degrees="$(echo "${in_degrees}" | sed "s|^${from}=${old_degree}$|${from}=${new_degree}|")"
+        fi
+      done <<< "${_GRAPH_EDGES}"
+    done <<< "${batch}"
+
+    remaining="${next_remaining}"
+  done
 }
 
 # ─── Graph als Text-Baum ausgeben ─────────────────────────────────────────

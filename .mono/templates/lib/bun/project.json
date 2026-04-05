@@ -1,0 +1,19 @@
+{
+  "name": "{{LIB_NAME}}",
+  "type": "lib",
+  "path": "libs/{{LIB_PATH}}",
+  "targets": {
+    "build": {
+      "command": "bun build src/index.ts --outdir dist --target bun",
+      "outputs": ["dist/**"]
+    },
+    "test": {
+      "command": "bun test",
+      "dependsOn": ["build"]
+    },
+    "lint": {
+      "command": "bun run lint"
+    }
+  },
+  "dependencies": []
+}

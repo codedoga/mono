@@ -3,6 +3,8 @@
 
 # Graph-Library laden
 source "${MONO_DIR}/lib/graph.sh"
+# Cache-Library laden
+source "${MONO_DIR}/lib/cache.sh"
 
 DEPLOY_TAG="${MONO_DEPLOY_TAG:-deploy/latest}"
 
@@ -20,7 +22,10 @@ affected::help() {
   echo "  --ref <ref>           Beliebige Git-Ref als Vergleichsbasis"
   echo "  --apps                Nur geänderte Apps"
   echo "  --libs                Nur geänderte Libs"
+  echo "  --parallel            Unabhängige Projekte parallel ausführen"
+  echo "  -j <N>                Max. parallele Prozesse (Standard: unbegrenzt)"
   echo "  --skip-deps           dependsOn-Kette überspringen"
+  echo "  --no-cache            Caching deaktivieren"
   echo "  --dry-run             Zeigt was ausgeführt würde"
   echo "  --continue-on-error   Bei Fehler weitermachen"
   echo "  --help, -h            Diese Hilfe anzeigen"
@@ -34,6 +39,8 @@ affected::help() {
   echo "  mono affected --target build --apps      # build nur in geänderten Apps"
   echo "  mono affected --target lint --ref main~3 # lint seit 3 Commits"
   echo "  mono affected --target build --dry-run   # Zeigt Plan"
+  echo "  mono affected --target build --parallel  # Parallel bauen"
+  echo "  mono affected --target test --parallel -j 4  # Max 4 gleichzeitig"
   echo ""
   echo -e "${BOLD}Kombination mit CI/CD:${NC}"
   echo "  mono affected --target test --continue-on-error"
@@ -138,6 +145,7 @@ affected::execute_with_deps() {
   local target="$2"
   local skip_deps="$3"
   local _executed="$4"
+  local no_cache="${5:-false}"
 
   local project_file="${MONO_ROOT}/${project_dir}/project.json"
   local full_dir="${MONO_ROOT}/${project_dir}"
@@ -167,7 +175,7 @@ affected::execute_with_deps() {
 
       while IFS= read -r dep; do
         [[ -z "${dep}" ]] && continue
-        affected::execute_with_deps "${project_dir}" "${dep}" "${skip_deps}" "${_executed}" || return 1
+        affected::execute_with_deps "${project_dir}" "${dep}" "${skip_deps}" "${_executed}" "${no_cache}" || return 1
         _executed="${_executed:+${_executed},}${dep}"
       done <<< "${deps}"
     fi
@@ -177,6 +185,23 @@ affected::execute_with_deps() {
   proj_name="$(graph::json_field "${project_file}" "name")"
   [[ -z "${proj_name}" ]] && proj_name="$(basename "${project_dir}")"
 
+  # Cache-Check
+  local use_cache=false
+  local input_hash=""
+
+  if [[ "${no_cache}" != "true" ]]; then
+    if cache::is_cacheable "${project_file}" "${target}"; then
+      use_cache=true
+      input_hash="$(cache::compute_hash "${project_dir}" "${target}" "${command}")"
+
+      if cache::check "${project_dir}" "${target}" "${input_hash}"; then
+        mono::log "${BOLD}${proj_name}:${target}${NC} ${GREEN}[cache hit]${NC} ✓"
+        cache::restore_outputs "${project_dir}" "${target}" "${input_hash}" 2>/dev/null || true
+        return 0
+      fi
+    fi
+  fi
+
   mono::log "${BOLD}${proj_name}:${target}${NC} → ${command}"
 
   (cd "${full_dir}" && eval "${command}")
@@ -185,6 +210,12 @@ affected::execute_with_deps() {
   if [[ ${exit_code} -ne 0 ]]; then
     mono::error "Target ${BOLD}${target}${NC} fehlgeschlagen (Exit: ${exit_code})"
     return ${exit_code}
+  fi
+
+  # Cache speichern
+  if [[ "${use_cache}" == true && -n "${input_hash}" ]]; then
+    cache::save "${project_dir}" "${target}" "${input_hash}" "${command}"
+    cache::cleanup_target "${project_dir}" "${target}" "${input_hash}"
   fi
 
   mono::log "Target ${BOLD}${target}${NC} abgeschlossen ✓"
@@ -197,8 +228,11 @@ affected::run() {
   local base_ref=""
   local filter="all"
   local skip_deps=false
+  local no_cache=false
   local dry_run=false
   local continue_on_error=false
+  local parallel=false
+  local max_parallel=0
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -207,7 +241,10 @@ affected::run() {
       --ref)        base_ref="${2:-}"; shift 2 ;;
       --apps)       filter="apps"; shift ;;
       --libs)       filter="libs"; shift ;;
+      --parallel)   parallel=true; shift ;;
+      -j)           max_parallel="${2:-0}"; parallel=true; shift 2 ;;
       --skip-deps)  skip_deps=true; shift ;;
+      --no-cache)   no_cache=true; shift ;;
       --dry-run)    dry_run=true; shift ;;
       --continue-on-error) continue_on_error=true; shift ;;
       --help|-h)    affected::help; return 0 ;;
@@ -320,13 +357,14 @@ affected::run() {
     matching_list="${matching_list}${proj}"$'\n'
   done
 
-  local sorted_projects
-  sorted_projects="$(graph::topo_sort "${matching_list}")" || return 1
+  # Batched sortieren
+  local batched_projects
+  batched_projects="$(graph::topo_batches "${matching_list}")" || return 1
 
   local -a ordered_projects=()
-  while IFS= read -r proj; do
-    [[ -n "${proj}" ]] && ordered_projects+=("${proj}")
-  done <<< "${sorted_projects}"
+  while IFS= read -r line; do
+    [[ -n "${line}" && "${line}" != "---" ]] && ordered_projects+=("${line}")
+  done <<< "${batched_projects}"
 
   # ─── Direkt vs. transitiv markieren ────────────────────────────────────
   local directly_changed_list=",$(echo "${directly_changed}" | tr '\n' ','),"
@@ -347,7 +385,12 @@ affected::run() {
 
   local count_info="${direct_count} direkt"
   [[ ${transitive_count} -gt 0 ]] && count_info="${count_info}, ${transitive_count} transitiv"
-  mono::log "Target ${BOLD}${target}${NC} in ${#ordered_projects[@]} Projekt(en) (${count_info})"
+  local mode_info=""
+  if [[ "${parallel}" == true ]]; then
+    mode_info=", parallel"
+    [[ ${max_parallel} -gt 0 ]] && mode_info=", parallel max ${max_parallel}"
+  fi
+  mono::log "Target ${BOLD}${target}${NC} in ${#ordered_projects[@]} Projekt(en) (${count_info}${mode_info})"
 
   if [[ ${#skipped_projects[@]} -gt 0 ]]; then
     mono::warn "${#skipped_projects[@]} betroffene(s) Projekt(e) übersprungen (Target nicht vorhanden)"
@@ -355,22 +398,29 @@ affected::run() {
 
   if [[ "${dry_run}" == true ]]; then
     echo ""
-    echo -e "${BOLD}Ausführungsplan (Reihenfolge):${NC}"
+    echo -e "${BOLD}Ausführungsplan:${NC}"
+    local batch_num=1
     local i=1
-    for proj in "${ordered_projects[@]}"; do
+    while IFS= read -r line; do
+      if [[ "${line}" == "---" ]]; then
+        batch_num=$((batch_num + 1))
+        continue
+      fi
+      [[ -z "${line}" ]] && continue
+
       local name
-      name="$(graph::name_of "${proj}")"
-      [[ -z "${name}" ]] && name="$(basename "${proj}")"
+      name="$(graph::name_of "${line}")"
+      [[ -z "${name}" ]] && name="$(basename "${line}")"
 
       local marker=""
-      if [[ "${directly_changed_list}" == *",${proj},"* ]]; then
+      if [[ "${directly_changed_list}" == *",${line},"* ]]; then
         marker=" ${GREEN}(geändert)${NC}"
       else
         marker=" ${YELLOW}(transitiv)${NC}"
       fi
 
       local deps
-      deps="$(graph::deps_of "${proj}")"
+      deps="$(graph::deps_of "${line}")"
       local dep_str=""
       if [[ -n "${deps}" ]]; then
         local dep_names=""
@@ -383,9 +433,14 @@ affected::run() {
         dep_str=" ← ${dep_names}"
       fi
 
-      echo -e "  ${BOLD}${i}.${NC} ${CYAN}${name}${NC}:${target}${marker}${dep_str}"
-      ((i++))
-    done
+      local batch_label=""
+      if [[ "${parallel}" == true ]]; then
+        batch_label=" ${YELLOW}[Batch ${batch_num}]${NC}"
+      fi
+
+      echo -e "  ${BOLD}${i}.${NC} ${CYAN}${name}${NC}:${target}${marker}${dep_str}${batch_label}"
+      i=$((i + 1))
+    done <<< "${batched_projects}"
     echo ""
     return 0
   fi
@@ -396,36 +451,164 @@ affected::run() {
   local failed=0
   local -a failed_projects=()
 
-  for proj in "${ordered_projects[@]}"; do
-    ((current++))
+  if [[ "${parallel}" == true ]]; then
+    # ── Parallele Ausführung: batch-weise ──────────────────────────────
+    local tmp_dir
+    tmp_dir="$(mktemp -d)"
 
-    local name
-    name="$(graph::name_of "${proj}")"
-    [[ -z "${name}" ]] && name="$(basename "${proj}")"
+    local batch_num=0
+    local -a current_batch=()
 
-    local marker=""
-    if [[ "${directly_changed_list}" != *",${proj},"* ]]; then
-      marker=" ${YELLOW}(transitiv)${NC}"
+    affected::exec_batch() {
+      local -a batch_projs=("$@")
+      local -a pids=()
+      local slot=0
+
+      for proj in "${batch_projs[@]}"; do
+        current=$((current + 1))
+        local name
+        name="$(graph::name_of "${proj}")"
+        [[ -z "${name}" ]] && name="$(basename "${proj}")"
+
+        local log_file="${tmp_dir}/${name}.log"
+
+        if [[ ${max_parallel} -gt 0 && ${slot} -ge ${max_parallel} ]]; then
+          local waited=false
+          while [[ "${waited}" != true ]]; do
+            for idx in "${!pids[@]}"; do
+              if ! kill -0 "${pids[$idx]}" 2>/dev/null; then
+                wait "${pids[$idx]}" 2>/dev/null || true
+                unset "pids[$idx]"
+                pids=(${pids[@]+"${pids[@]}"})
+                slot=$((slot - 1))
+                waited=true
+                break
+              fi
+            done
+            if [[ "${waited}" != true ]]; then
+              sleep 0.1
+            fi
+          done
+        fi
+
+        mono::log "▶ ${BOLD}${name}:${target}${NC} (parallel)"
+
+        (
+          affected::execute_with_deps "${proj}" "${target}" "${skip_deps}" "" "${no_cache}" \
+            > "${log_file}" 2>&1
+          echo $? > "${log_file}.exit"
+        ) &
+        pids+=($!)
+        slot=$((slot + 1))
+      done
+
+      for pid in ${pids[@]+"${pids[@]}"}; do
+        wait "${pid}" 2>/dev/null || true
+      done
+
+      for proj in "${batch_projs[@]}"; do
+        local name
+        name="$(graph::name_of "${proj}")"
+        [[ -z "${name}" ]] && name="$(basename "${proj}")"
+
+        local marker=""
+        if [[ "${directly_changed_list}" != *",${proj},"* ]]; then
+          marker=" ${YELLOW}(transitiv)${NC}"
+        fi
+
+        local log_file="${tmp_dir}/${name}.log"
+        local exit_file="${log_file}.exit"
+        local exit_code=0
+        [[ -f "${exit_file}" ]] && exit_code="$(cat "${exit_file}")"
+
+        echo ""
+        echo -e "${BOLD}━━━ ${CYAN}${name}${NC}${BOLD}:${target}${marker} ━━━${NC}"
+
+        if [[ -f "${log_file}" ]]; then
+          cat "${log_file}"
+        fi
+
+        if [[ "${exit_code}" -ne 0 ]]; then
+          failed=$((failed + 1))
+          failed_projects+=("${name}")
+
+          if [[ "${continue_on_error}" != true ]]; then
+            rm -rf "${tmp_dir}"
+            echo ""
+            mono::error "Abbruch nach Fehler in ${BOLD}${name}:${target}${NC}"
+            return "${exit_code}"
+          fi
+        fi
+
+        rm -f "${log_file}" "${exit_file}"
+      done
+    }
+
+    while IFS= read -r line; do
+      if [[ "${line}" == "---" ]]; then
+        if [[ ${#current_batch[@]} -gt 0 ]]; then
+          batch_num=$((batch_num + 1))
+          if [[ ${#current_batch[@]} -gt 1 ]]; then
+            mono::log "Batch ${batch_num}: ${#current_batch[@]} Projekte parallel"
+          fi
+          affected::exec_batch "${current_batch[@]}" || { rm -rf "${tmp_dir}"; return 1; }
+
+          if [[ ${failed} -gt 0 && "${continue_on_error}" != true ]]; then
+            rm -rf "${tmp_dir}"
+            return 1
+          fi
+
+          current_batch=()
+        fi
+        continue
+      fi
+      [[ -z "${line}" ]] && continue
+      current_batch+=("${line}")
+    done <<< "${batched_projects}"
+
+    if [[ ${#current_batch[@]} -gt 0 ]]; then
+      batch_num=$((batch_num + 1))
+      if [[ ${#current_batch[@]} -gt 1 ]]; then
+        mono::log "Batch ${batch_num}: ${#current_batch[@]} Projekte parallel"
+      fi
+      affected::exec_batch "${current_batch[@]}" || { rm -rf "${tmp_dir}"; return 1; }
     fi
 
-    echo ""
-    echo -e "${BOLD}━━━ [${current}/${total}] ${CYAN}${name}${NC}${BOLD}:${target}${marker} ━━━${NC}"
+    rm -rf "${tmp_dir}"
 
-    affected::execute_with_deps "${proj}" "${target}" "${skip_deps}" "" || {
-      local exit_code=$?
-      ((failed++))
-      failed_projects+=("${name}")
+  else
+    # ── Sequentielle Ausführung ────────────────────────────────────────
+    for proj in "${ordered_projects[@]}"; do
+      current=$((current + 1))
 
-      if [[ "${continue_on_error}" != true ]]; then
-        echo ""
-        mono::error "Abbruch nach Fehler in ${BOLD}${name}:${target}${NC}"
-        mono::error "${failed} von ${current} Projekt(en) fehlgeschlagen"
-        return ${exit_code}
+      local name
+      name="$(graph::name_of "${proj}")"
+      [[ -z "${name}" ]] && name="$(basename "${proj}")"
+
+      local marker=""
+      if [[ "${directly_changed_list}" != *",${proj},"* ]]; then
+        marker=" ${YELLOW}(transitiv)${NC}"
       fi
 
-      mono::warn "Fehler in ${BOLD}${name}:${target}${NC} – fahre fort"
-    }
-  done
+      echo ""
+      echo -e "${BOLD}━━━ [${current}/${total}] ${CYAN}${name}${NC}${BOLD}:${target}${marker} ━━━${NC}"
+
+      affected::execute_with_deps "${proj}" "${target}" "${skip_deps}" "" "${no_cache}" || {
+        local exit_code=$?
+        failed=$((failed + 1))
+        failed_projects+=("${name}")
+
+        if [[ "${continue_on_error}" != true ]]; then
+          echo ""
+          mono::error "Abbruch nach Fehler in ${BOLD}${name}:${target}${NC}"
+          mono::error "${failed} von ${current} Projekt(en) fehlgeschlagen"
+          return ${exit_code}
+        fi
+
+        mono::warn "Fehler in ${BOLD}${name}:${target}${NC} – fahre fort"
+      }
+    done
+  fi
 
   # ─── Zusammenfassung ────────────────────────────────────────────────────
   echo ""

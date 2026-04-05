@@ -3,6 +3,8 @@
 
 # Graph-Library laden
 source "${MONO_DIR}/lib/graph.sh"
+# Cache-Library laden
+source "${MONO_DIR}/lib/cache.sh"
 
 # ─── Help ───────────────────────────────────────────────────────────────────
 run::help() {
@@ -20,6 +22,7 @@ run::help() {
   echo -e "${BOLD}Optionen:${NC}"
   echo "  --skip-deps          dependsOn-Kette überspringen"
   echo "  --skip-project-deps  Cross-Project Dependencies überspringen"
+  echo "  --no-cache            Caching deaktivieren"
   echo "  --dry-run             Zeigt was ausgeführt würde, ohne es zu tun"
   echo "  --list                Alle Targets eines Projekts auflisten"
   echo "  --help, -h            Diese Hilfe anzeigen"
@@ -212,6 +215,7 @@ run::execute_target() {
   local _executed="$5"  # Bereits ausgeführte Targets (komma-separiert)
   local skip_project_deps="${6:-false}"
   local _executed_projects="${7:-}"  # Bereits ausgeführte Projekte (komma-separiert)
+  local no_cache="${8:-false}"
 
   local project_file="${MONO_ROOT}/${project_dir}/project.json"
   local full_dir="${MONO_ROOT}/${project_dir}"
@@ -249,7 +253,7 @@ run::execute_target() {
             mono::log "${YELLOW}[dep]${NC} ${BOLD}${dep_name}:${target}${NC}"
           fi
 
-          run::execute_target "${dep_dir}" "${target}" "${skip_deps}" "${dry_run}" "" "${skip_project_deps}" "${_executed_projects}" || return 1
+          run::execute_target "${dep_dir}" "${target}" "${skip_deps}" "${dry_run}" "" "${skip_project_deps}" "${_executed_projects}" "${no_cache}" || return 1
           _executed_projects="${_executed_projects:+${_executed_projects},}${dep_name}"
         fi
       done <<< "${proj_deps}"
@@ -277,7 +281,7 @@ run::execute_target() {
     if [[ -n "${deps}" ]]; then
       while IFS= read -r dep; do
         [[ -z "${dep}" ]] && continue
-        run::execute_target "${project_dir}" "${dep}" "${skip_deps}" "${dry_run}" "${_executed}" || return 1
+        run::execute_target "${project_dir}" "${dep}" "${skip_deps}" "${dry_run}" "${_executed}" "${skip_project_deps}" "${_executed_projects}" "${no_cache}" || return 1
         _executed="${_executed:+${_executed},}${dep}"
       done <<< "${deps}"
     fi
@@ -287,6 +291,23 @@ run::execute_target() {
   local proj_name
   proj_name="$(run::json_field "${project_file}" "name")"
   [[ -z "${proj_name}" ]] && proj_name="$(basename "${project_dir}")"
+
+  # ─── Cache-Check ──────────────────────────────────────────────────────
+  local use_cache=false
+  local input_hash=""
+
+  if [[ "${no_cache}" != "true" && "${dry_run}" != "true" ]]; then
+    if cache::is_cacheable "${project_file}" "${target}"; then
+      use_cache=true
+      input_hash="$(cache::compute_hash "${project_dir}" "${target}" "${command}")"
+
+      if cache::check "${project_dir}" "${target}" "${input_hash}"; then
+        mono::log "${BOLD}${proj_name}:${target}${NC} ${GREEN}[cache hit]${NC} ✓"
+        cache::restore_outputs "${project_dir}" "${target}" "${input_hash}" 2>/dev/null || true
+        return 0
+      fi
+    fi
+  fi
 
   if [[ "${dry_run}" == "true" ]]; then
     echo -e "  ${CYAN}${proj_name}:${target}${NC} → ${command}"
@@ -305,6 +326,12 @@ run::execute_target() {
       return ${exit_code}
     fi
 
+    # Cache speichern
+    if [[ "${use_cache}" == true && -n "${input_hash}" ]]; then
+      cache::save "${project_dir}" "${target}" "${input_hash}" "${command}"
+      cache::cleanup_target "${project_dir}" "${target}" "${input_hash}"
+    fi
+
     mono::log "Target ${BOLD}${target}${NC} abgeschlossen ✓"
   fi
 
@@ -316,6 +343,7 @@ run::main() {
   local input=""
   local skip_deps=false
   local skip_project_deps=false
+  local no_cache=false
   local dry_run=false
   local list_mode=false
 
@@ -323,6 +351,7 @@ run::main() {
     case "$1" in
       --skip-deps)  skip_deps=true; shift ;;
       --skip-project-deps) skip_project_deps=true; shift ;;
+      --no-cache)   no_cache=true; shift ;;
       --dry-run)    dry_run=true; shift ;;
       --list)       list_mode=true; shift ;;
       --help|-h)    run::help; return 0 ;;
@@ -385,7 +414,7 @@ run::main() {
     echo ""
   fi
 
-  run::execute_target "${project_dir}" "${target}" "${skip_deps}" "${dry_run}" "" "${skip_project_deps}" ""
+  run::execute_target "${project_dir}" "${target}" "${skip_deps}" "${dry_run}" "" "${skip_project_deps}" "" "${no_cache}"
 }
 
 # ─── Start ──────────────────────────────────────────────────────────────────
