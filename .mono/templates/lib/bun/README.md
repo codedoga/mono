@@ -9,7 +9,7 @@ Wiederverwendbare Library für den Einsatz in Apps und anderen Libs.
 ## Verwendung
 
 ```typescript
-import { hello } from "{{LIB_NAME}}";
+import { hello } from "@libs/{{LIB_NAME}}";
 ```
 
 ## Entwicklung

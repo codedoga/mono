@@ -1,6 +1,12 @@
 # dependencies (bun install)
 node_modules
 
+# lockfiles in Unterprojekten (Root bun.lock wird committed)
+apps/*/bun.lock
+apps/*/bun.lockb
+libs/*/bun.lock
+libs/*/bun.lockb
+
 # output
 out
 dist

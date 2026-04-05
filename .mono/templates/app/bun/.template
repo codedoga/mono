@@ -1,2 +1,2 @@
 Bun-Projekt mit TypeScript
-init: bun init
+init: bun install
