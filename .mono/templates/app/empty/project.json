@@ -1,0 +1,9 @@
+{
+  "name": "{{APP_NAME}}",
+  "type": "app",
+  "path": "apps/{{APP_PATH}}",
+  "targets": {},
+  "deploy": {
+    "strategy": "none"
+  }
+}

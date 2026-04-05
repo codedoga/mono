@@ -47,6 +47,9 @@ Das Monorepo wird über das CLI-Tool `mono` verwaltet.
 |---------|-------------|
 | `help`  | Zeigt alle verfügbaren Commands |
 | `generate app <name>` | Erstellt eine neue App aus einem Template |
+| `run <projekt>:<target>` | Führt ein Target aus der project.json aus |
+| `changed` | Zeigt geänderte Apps/Libs seit dem letzten Deploy |
+| `deploy-mark` | Setzt den Deploy-Tag auf den aktuellen Commit |
 | `hello` | Beispiel-Command |
 
 ### `generate app`
@@ -72,6 +75,118 @@ Erstellt eine neue App im `apps/`-Verzeichnis aus einem Template.
 Wird kein `--template` angegeben, erfolgt eine interaktive Auswahl.
 
 **Eigene Templates erstellen:** Neuen Ordner unter `.mono/templates/app/<name>/` anlegen. Dateien können die Platzhalter `{{APP_NAME}}` und `{{APP_PATH}}` verwenden. Eine `.template`-Datei (erste Zeile = Beschreibung) wird als Metadatei genutzt und nicht kopiert.
+
+### `changed`
+
+Erkennt welche Apps und Libs sich seit dem letzten Deploy geändert haben. Vergleicht dazu `HEAD` mit dem Git-Tag `deploy/latest`.
+
+```bash
+./mono changed                        # Alle Änderungen seit deploy/latest
+./mono changed --apps                 # Nur geänderte Apps
+./mono changed --libs                 # Nur geänderte Libs
+./mono changed --json                 # JSON-Ausgabe für CI/CD
+./mono changed --quiet                # Nur Pfade (eine pro Zeile)
+./mono changed --ref main~5           # Vergleich mit beliebiger Git-Ref
+```
+
+Die Projekt-Erkennung basiert auf der `project.json` im Projektverzeichnis. Projekte ohne `project.json` werden mit einer Warnung angezeigt.
+
+Die JSON-Ausgabe (`--json`) enthält die Deploy-Konfiguration aus der `project.json`:
+
+```json
+{
+  "base": "a4007f0",
+  "head": "c6ba265",
+  "changed": [
+    {
+      "path": "apps/my-api",
+      "name": "my-api",
+      "type": "app",
+      "deploy": { "strategy": "bun" }
+    }
+  ]
+}
+```
+
+### `project.json`
+
+Jedes Projekt (App/Lib) enthält eine `project.json`, die als Projekt-Marker, Target- und Deploy-Konfiguration dient:
+
+```json
+{
+  "name": "my-app",
+  "type": "app",
+  "path": "apps/my-app",
+  "targets": {
+    "install": {
+      "command": "bun install"
+    },
+    "dev": {
+      "command": "bun run --watch src/index.ts",
+      "dependsOn": ["install"]
+    },
+    "build": {
+      "command": "bun build src/index.ts --outdir dist",
+      "dependsOn": ["install"]
+    },
+    "start": {
+      "command": "bun run src/index.ts",
+      "dependsOn": ["build"]
+    },
+    "test": {
+      "command": "bun test",
+      "dependsOn": ["install"]
+    }
+  },
+  "deploy": {
+    "strategy": "bun",
+    "entrypoint": "src/index.ts"
+  },
+  "dependencies": []
+}
+```
+
+| Feld | Beschreibung |
+|------|-------------|
+| `name` | Projektname |
+| `type` | `app` oder `lib` |
+| `path` | Relativer Pfad im Monorepo |
+| `targets` | Ausführbare Befehle (siehe `mono run`) |
+| `targets.<name>.command` | Der CLI-Befehl, der ausgeführt wird |
+| `targets.<name>.dependsOn` | Targets, die vorher ausgeführt werden müssen |
+| `deploy.strategy` | Deploy-Strategie (`bun`, `docker`, `static`, `none`, ...) |
+| `dependencies` | Lib-Abhängigkeiten (optional) |
+
+### `run`
+
+Führt Targets aus der `project.json` eines Projekts aus. Löst dabei automatisch die `dependsOn`-Kette auf.
+
+```bash
+./mono run my-app:dev                # Führt 'dev' aus (inkl. install)
+./mono run my-app:build              # Führt 'build' aus (inkl. install)
+./mono run my-app:start              # Führt 'start' aus (inkl. build → install)
+./mono run my-app:start --skip-deps  # Nur start, ohne Dependencies
+./mono run my-app:start --dry-run    # Zeigt Ausführungsplan ohne zu starten
+./mono run my-app --list              # Alle Targets auflisten
+./mono run my-app                     # Alle Targets auflisten (Kurzform)
+```
+
+Projekte können über ihren Namen oder Pfad referenziert werden:
+
+```bash
+./mono run my-app:dev                # Über project.json name
+./mono run backend/my-api:dev        # Über Pfad unter apps/
+```
+
+### `deploy-mark`
+
+Markiert den aktuellen Commit als letzten Deploy-Stand.
+
+```bash
+./mono deploy-mark                    # Setzt deploy/latest auf HEAD
+./mono deploy-mark --push             # Setzt Tag und pusht zum Remote
+./mono deploy-mark --tag deploy/prod  # Eigener Tag-Name
+```
 
 ### Neuen Command erstellen
 

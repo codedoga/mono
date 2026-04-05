@@ -168,11 +168,30 @@ app::generate() {
   echo ""
   mono::log "App erstellt: ${BOLD}apps/${name}${NC} (Template: ${template})"
   mono::log "${file_count} Datei(en) generiert"
+
+  # Post-Init Command ausführen (falls in .template definiert)
+  local template_meta="${template_dir}/.template"
+  local init_cmd=""
+  if [[ -f "${template_meta}" ]]; then
+    init_cmd="$(grep '^init:' "${template_meta}" | sed 's/^init:[[:space:]]*//' | head -1)"
+  fi
+
+  if [[ -n "${init_cmd}" ]]; then
+    echo ""
+    mono::log "Post-Init: ${BOLD}${init_cmd}${NC}"
+    echo ""
+    (cd "${target_dir}" && eval "${init_cmd}")
+    local exit_code=$?
+    if [[ ${exit_code} -ne 0 ]]; then
+      mono::warn "Post-Init Command beendet mit Exit-Code ${exit_code}"
+    fi
+  fi
+
   echo ""
 
   # Verzeichnisinhalt anzeigen
   echo -e "${BOLD}Erstellt:${NC}"
-  (cd "${MONO_ROOT}" && find "apps/${name}" -type f | sort | sed 's/^/  /')
+  (cd "${MONO_ROOT}" && find "apps/${name}" -type f -not -path '*/node_modules/*' -not -path '*/.git/*' | sort | sed 's/^/  /')
   echo ""
 }
 
