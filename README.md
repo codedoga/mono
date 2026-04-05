@@ -2,7 +2,16 @@
 
 A lightweight monorepo tooling based solely on Bash and standard Unix tools. No Python, no Node, no jq – just POSIX-compliant built-in tools + Git.
 
-> **Note:** This project is developed internally by [codelabrx](https://github.com/codelabrx) and is **not an actively maintained open-source project**. It is freely available under the GPL-3.0 license but is not maintained or extended for external use cases. Those who wish to adapt it to their own needs are welcome to fork the repository.
+> **Note:** This project is developed internally by [codelabrx](https://github.com/codelabrx) and is **not an actively maintained open-source project**. It is freely available under the MIT license but is not maintained or extended for external use cases. Those who wish to adapt it to their own needs are welcome to fork the repository.
+
+## License
+
+This project is licensed under the MIT License.
+
+## Maintenance
+
+This project is provided "as is" without active maintenance.
+Pull requests or issues may not be reviewed.
 
 ## Installation
 
