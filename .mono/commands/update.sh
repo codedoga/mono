@@ -1,0 +1,249 @@
+#!/usr/bin/env bash
+# description: mono CLI auf die neueste Version aktualisieren
+
+MONO_REPO="${MONO_UPDATE_REPO:-codelabrx/monorepo}"
+MONO_VERSION_FILE="${MONO_DIR}/VERSION"
+
+# ─── Help ───────────────────────────────────────────────────────────────────
+update::help() {
+  echo ""
+  echo -e "${BOLD}mono update${NC} – CLI aktualisieren"
+  echo ""
+  echo -e "${BOLD}Verwendung:${NC}"
+  echo "  mono update [optionen]"
+  echo ""
+  echo -e "${BOLD}Optionen:${NC}"
+  echo "  --version <tag>     Bestimmte Version installieren (z.B. v1.0.0)"
+  echo "  --check             Nur prüfen ob ein Update verfügbar ist"
+  echo "  --list              Verfügbare Versionen anzeigen"
+  echo "  --help, -h          Diese Hilfe anzeigen"
+  echo ""
+  echo -e "${BOLD}Beispiele:${NC}"
+  echo "  mono update                         # Update auf neueste Version"
+  echo "  mono update --check                 # Prüft auf Updates"
+  echo "  mono update --version v1.2.0        # Bestimmte Version installieren"
+  echo "  mono update --list                  # Zeigt verfügbare Versionen"
+  echo ""
+  echo -e "${BOLD}Aktuelle Version:${NC}"
+  echo "  $(update::current_version)"
+  echo ""
+}
+
+# ─── Aktuelle Version lesen ────────────────────────────────────────────────
+update::current_version() {
+  if [[ -f "${MONO_VERSION_FILE}" ]]; then
+    tr -d '[:space:]' < "${MONO_VERSION_FILE}"
+  else
+    echo "unknown"
+  fi
+}
+
+# ─── Verfügbare Versionen von GitHub laden ─────────────────────────────────
+update::fetch_tags() {
+  curl -fsSL "https://api.github.com/repos/${MONO_REPO}/tags?per_page=20" 2>/dev/null \
+    | grep '"name"' \
+    | sed 's/.*"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/' \
+    | grep '^v'
+}
+
+# ─── Neueste Version ermitteln ─────────────────────────────────────────────
+update::latest_version() {
+  update::fetch_tags | head -1
+}
+
+# ─── Versions-Check ───────────────────────────────────────────────────────
+update::check() {
+  local current
+  current="$(update::current_version)"
+
+  mono::log "Aktuelle Version: ${BOLD}${current}${NC}"
+  mono::log "Prüfe auf Updates..."
+
+  local latest
+  latest="$(update::latest_version)"
+
+  if [[ -z "${latest}" ]]; then
+    mono::error "Konnte keine Versionen von GitHub laden"
+    mono::warn "Prüfe deine Internetverbindung und ob das Repository ${BOLD}${MONO_REPO}${NC} existiert"
+    return 1
+  fi
+
+  if [[ "${current}" == "${latest}" || "v${current}" == "${latest}" ]]; then
+    mono::log "Du verwendest bereits die neueste Version ${BOLD}${latest}${NC}"
+    return 0
+  fi
+
+  echo ""
+  mono::log "Update verfügbar: ${BOLD}${current}${NC} → ${BOLD}${latest}${NC}"
+  echo -e "  Führe ${CYAN}mono update${NC} aus um zu aktualisieren"
+  echo ""
+}
+
+# ─── Versionen auflisten ──────────────────────────────────────────────────
+update::list_versions() {
+  local current
+  current="$(update::current_version)"
+
+  echo ""
+  echo -e "${BOLD}Verfügbare Versionen${NC}"
+  echo ""
+
+  local tags
+  tags="$(update::fetch_tags)"
+
+  if [[ -z "${tags}" ]]; then
+    mono::error "Konnte keine Versionen von GitHub laden"
+    return 1
+  fi
+
+  while IFS= read -r tag; do
+    local version_bare="${tag#v}"
+    if [[ "${current}" == "${tag}" || "${current}" == "${version_bare}" ]]; then
+      echo -e "  ${GREEN}${tag}${NC} ← aktuell"
+    else
+      echo -e "  ${CYAN}${tag}${NC}"
+    fi
+  done <<< "${tags}"
+
+  echo ""
+}
+
+# ─── Download und Installation ─────────────────────────────────────────────
+update::install() {
+  local version="$1"
+  local current
+  current="$(update::current_version)"
+
+  # Version validieren
+  if [[ -z "${version}" ]]; then
+    version="$(update::latest_version)"
+    if [[ -z "${version}" ]]; then
+      mono::error "Konnte neueste Version nicht ermitteln"
+      return 1
+    fi
+  fi
+
+  # Prüfen ob schon auf dem Stand
+  local version_bare="${version#v}"
+  if [[ "${current}" == "${version}" || "${current}" == "${version_bare}" ]]; then
+    mono::log "Bereits auf Version ${BOLD}${version}${NC}"
+    return 0
+  fi
+
+  mono::log "Update: ${BOLD}${current}${NC} → ${BOLD}${version}${NC}"
+
+  # Temporäres Verzeichnis
+  local tmp_dir
+  tmp_dir="$(mktemp -d)"
+  trap "rm -rf '${tmp_dir}'" RETURN
+
+  # Tarball herunterladen
+  local tarball_url="https://github.com/${MONO_REPO}/archive/refs/tags/${version}.tar.gz"
+  mono::log "Lade ${BOLD}${version}${NC} herunter..."
+
+  if ! curl -fsSL "${tarball_url}" -o "${tmp_dir}/mono.tar.gz" 2>/dev/null; then
+    mono::error "Download fehlgeschlagen"
+    mono::warn "Version ${BOLD}${version}${NC} existiert möglicherweise nicht"
+    mono::warn "Verfügbare Versionen: ${CYAN}mono update --list${NC}"
+    return 1
+  fi
+
+  # Entpacken
+  if ! tar -xzf "${tmp_dir}/mono.tar.gz" -C "${tmp_dir}" 2>/dev/null; then
+    mono::error "Entpacken fehlgeschlagen"
+    return 1
+  fi
+
+  # Extrahiertes Verzeichnis finden
+  local extracted_dir
+  extracted_dir="$(find "${tmp_dir}" -maxdepth 1 -type d -name 'monorepo-*' | head -1)"
+
+  if [[ -z "${extracted_dir}" || ! -d "${extracted_dir}/.mono" ]]; then
+    mono::error "Ungültiges Archiv: .mono Verzeichnis nicht gefunden"
+    return 1
+  fi
+
+  # ─── Dateien aktualisieren ──────────────────────────────────────────────
+  mono::log "Aktualisiere Dateien..."
+
+  # Core-Verzeichnisse ersetzen
+  for dir in bin lib commands templates; do
+    if [[ -d "${extracted_dir}/.mono/${dir}" ]]; then
+      rm -rf "${MONO_DIR}/${dir}"
+      cp -R "${extracted_dir}/.mono/${dir}" "${MONO_DIR}/${dir}"
+    fi
+  done
+
+  # VERSION aktualisieren
+  if [[ -f "${extracted_dir}/.mono/VERSION" ]]; then
+    cp "${extracted_dir}/.mono/VERSION" "${MONO_VERSION_FILE}"
+  else
+    echo "${version_bare}" > "${MONO_VERSION_FILE}"
+  fi
+
+  # mono Wrapper aktualisieren
+  if [[ -f "${extracted_dir}/mono" ]]; then
+    cp "${extracted_dir}/mono" "${MONO_ROOT}/mono"
+    chmod +x "${MONO_ROOT}/mono"
+  fi
+
+  # Berechtigungen setzen
+  chmod +x "${MONO_DIR}/bin/mono"
+
+  local new_version
+  new_version="$(update::current_version)"
+  echo ""
+  mono::log "Erfolgreich auf ${BOLD}${new_version}${NC} aktualisiert!"
+  echo ""
+}
+
+# ─── Command Dispatcher ───────────────────────────────────────────────────
+update::run() {
+  local target_version=""
+  local mode="update"
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --version)
+        target_version="${2:-}"
+        if [[ -z "${target_version}" ]]; then
+          mono::error "Version fehlt: --version <tag>"
+          return 1
+        fi
+        shift 2
+        ;;
+      --check)
+        mode="check"
+        shift
+        ;;
+      --list)
+        mode="list"
+        shift
+        ;;
+      --help|-h)
+        update::help
+        return 0
+        ;;
+      *)
+        mono::error "Unbekannte Option: $1"
+        update::help
+        return 1
+        ;;
+    esac
+  done
+
+  case "${mode}" in
+    check)
+      update::check
+      ;;
+    list)
+      update::list_versions
+      ;;
+    update)
+      update::install "${target_version}"
+      ;;
+  esac
+}
+
+# ─── Start ──────────────────────────────────────────────────────────────────
+update::run "$@"
