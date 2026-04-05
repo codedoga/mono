@@ -1,0 +1,9 @@
+{
+  "name": "test-app",
+  "type": "app",
+  "path": "apps/test-app",
+  "targets": {},
+  "deploy": {
+    "strategy": "none"
+  }
+}
